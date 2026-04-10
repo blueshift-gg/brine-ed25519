@@ -1,14 +1,16 @@
 #![no_std]
 
 pub mod hasher;
+use core::mem::MaybeUninit;
 use curve25519_dalek::scalar::Scalar;
+use sha2::{Digest, Sha512 as Sha512Hasher};
 use solana_curve25519::{
     edwards::{multiply_edwards, subtract_edwards, validate_edwards, PodEdwardsPoint},
     scalar::PodScalar,
 };
 use solana_program_error::ProgramError;
 
-use crate::hasher::Hasher;
+use crate::hasher::{Hasher, Sha512};
 
 const ED25519_SIGNATURE_LEN: usize = 64;
 const ED25519_PUBKEY_LEN: usize = 32;
@@ -21,13 +23,72 @@ const G: PodEdwardsPoint = PodEdwardsPoint([
 
 /// Verify an ed25519 signature.
 #[inline(always)]
-pub fn sig_verify<H: Hasher>(pubkey: &[u8; ED25519_PUBKEY_LEN], sig: &[u8; ED25519_SIGNATURE_LEN], message: &[u8]) -> Result<(), ProgramError> {
-    let hash = H::hashv(&[sig[..32].as_ref(), pubkey.as_ref(), message]);
-    sig_verify_prehashed(pubkey, sig, &hash)
+pub fn sig_verify(pubkey: &[u8], sig: &[u8], message: &[u8]) -> Result<(), ProgramError> {
+    sig_verify_with_hasher::<Sha512>(pubkey, sig, message)
+}
+
+/// Verify an ed25519 signature over a vectored message.
+#[inline(always)]
+pub fn sig_verifyv(pubkey: &[u8], sig: &[u8], messagev: &[&[u8]]) -> Result<(), ProgramError> {
+    if pubkey.len() != ED25519_PUBKEY_LEN {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if sig.len() != ED25519_SIGNATURE_LEN {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    sig_verify_internal(
+        pubkey.try_into().unwrap(),
+        sig.try_into().unwrap(),
+        messagev,
+    )
+}
+
+/// Verify an ed25519 signature over prehashed bytes.
+#[inline(always)]
+pub fn sig_verify_prehashed(
+    pubkey: &[u8],
+    sig: &[u8],
+    message_hash: &[u8],
+) -> Result<(), ProgramError> {
+    if message_hash.len() != 64 {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    sig_verify_prehashed_raw(
+        pubkey.try_into().unwrap(),
+        sig.try_into().unwrap(),
+        message_hash.try_into().unwrap(),
+    )
 }
 
 #[inline(always)]
-pub fn sig_verify_prehashed(pubkey: &[u8; ED25519_PUBKEY_LEN], sig: &[u8; ED25519_SIGNATURE_LEN], hash: &[u8;64]) -> Result<(), ProgramError> {
+pub fn sig_verify_with_hasher<H: Hasher>(
+    pubkey: &[u8],
+    sig: &[u8],
+    message: &[u8],
+) -> Result<(), ProgramError> {
+    if pubkey.len() != ED25519_PUBKEY_LEN {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if sig.len() != ED25519_SIGNATURE_LEN {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let pubkey: [u8; ED25519_PUBKEY_LEN] = pubkey.try_into().unwrap();
+    let sig: [u8; ED25519_SIGNATURE_LEN] = sig.try_into().unwrap();
+    let hash = H::hashv(&[sig[..32].as_ref(), pubkey.as_ref(), message]);
+    sig_verify_prehashed_raw(&pubkey, &sig, &hash)
+}
+
+#[inline(always)]
+pub fn sig_verify_prehashed_raw(
+    pubkey: &[u8; ED25519_PUBKEY_LEN],
+    sig: &[u8; ED25519_SIGNATURE_LEN],
+    hash: &[u8; 64],
+) -> Result<(), ProgramError> {
     // Normally, we could verify the signature using the Solana SDK or
     // dalek_ed25519, but those are too compute, stack, and heap heavy for the
     // SVM.
@@ -83,6 +144,85 @@ pub fn sig_verify_prehashed(pubkey: &[u8; ED25519_PUBKEY_LEN], sig: &[u8; ED2551
         Ok(())
     } else {
         Err(ProgramError::MissingRequiredSignature)
+    }
+}
+
+#[inline(always)]
+fn sig_verify_internal(
+    pubkey: &[u8; ED25519_PUBKEY_LEN],
+    sig: &[u8; ED25519_SIGNATURE_LEN],
+    messagev: &[&[u8]],
+) -> Result<(), ProgramError> {
+    let pubkey_point = PodEdwardsPoint(*pubkey);
+    let (sig_lower, sig_upper) = split_signature(sig);
+
+    let sig_r = PodEdwardsPoint(sig_lower);
+    let sig_s: Scalar = Option::from(Scalar::from_canonical_bytes(sig_upper))
+        .ok_or(ProgramError::MissingRequiredSignature)?;
+
+    if is_small_order(&sig_r) || is_small_order(&pubkey_point) {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let pubkey_on_curve = validate_edwards(&pubkey_point);
+    let sig_r_on_curve = validate_edwards(&sig_r);
+    if !pubkey_on_curve || !sig_r_on_curve {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let k = challenge_scalar(&sig_r, pubkey, messagev);
+
+    let k_bytes = k.to_bytes();
+    let pubkey_bytes = pubkey_point.0;
+    let sig_s_bytes = sig_s.to_bytes();
+
+    let a = PodScalar(k_bytes);
+    let b = PodScalar(sig_s_bytes);
+    let base_point = G;
+
+    let s_b = multiply_edwards(&b, &base_point).ok_or(ProgramError::MissingRequiredSignature)?;
+    let k_a = multiply_edwards(&a, &PodEdwardsPoint(pubkey_bytes))
+        .ok_or(ProgramError::MissingRequiredSignature)?;
+    let r = subtract_edwards(&s_b, &k_a).ok_or(ProgramError::MissingRequiredSignature)?;
+
+    let expected_r = sig_r.0;
+    let computed_r = r.0;
+
+    if expected_r == computed_r {
+        Ok(())
+    } else {
+        Err(ProgramError::MissingRequiredSignature)
+    }
+}
+
+#[inline(always)]
+fn challenge_scalar(
+    sig_r: &PodEdwardsPoint,
+    pubkey: &[u8; ED25519_PUBKEY_LEN],
+    messagev: &[&[u8]],
+) -> Scalar {
+    let mut h = Sha512Hasher::new();
+    h.update(sig_r.0);
+    h.update(pubkey);
+
+    for message in messagev {
+        h.update(message);
+    }
+
+    let f = h.finalize();
+    Scalar::from_bytes_mod_order_wide(f.as_ref())
+}
+
+#[inline(always)]
+fn split_signature(sig: &[u8; ED25519_SIGNATURE_LEN]) -> ([u8; 32], [u8; 32]) {
+    let mut sig_lower: MaybeUninit<[u8; 32]> = MaybeUninit::uninit();
+    let mut sig_upper: MaybeUninit<[u8; 32]> = MaybeUninit::uninit();
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(sig.as_ptr(), sig_lower.as_mut_ptr() as *mut u8, 32);
+        core::ptr::copy_nonoverlapping(sig.as_ptr().add(32), sig_upper.as_mut_ptr() as *mut u8, 32);
+
+        (sig_lower.assume_init(), sig_upper.assume_init())
     }
 }
 
@@ -168,12 +308,58 @@ mod tests {
             142, 73, 85, 43, 81, 152, 204, 13,
         ];
 
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, "hello world".as_bytes()).is_ok());
+        assert!(sig_verify_with_hasher::<Sha512>(&pubkey, &sig, "hello world".as_bytes()).is_ok());
         let hash = Sha512::hashv(&[sig[..32].as_ref(), pubkey.as_ref(), "hello world".as_ref()]);
         assert!(sig_verify_prehashed(&pubkey, &sig, &hash).is_ok());
-        let wrong_hash = Sha512::hashv(&[sig[32..].as_ref(), pubkey.as_ref(), "hello world".as_ref()]);
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, "not the right message".as_bytes()).is_err());
+        let wrong_hash =
+            Sha512::hashv(&[sig[32..].as_ref(), pubkey.as_ref(), "hello world".as_ref()]);
+        assert!(sig_verify_with_hasher::<Sha512>(
+            &pubkey,
+            &sig,
+            "not the right message".as_bytes()
+        )
+        .is_err());
         assert!(sig_verify_prehashed(&pubkey, &sig, &wrong_hash).is_err());
+    }
+
+    #[test]
+    fn test_default_wrappers() {
+        let pubkey: [u8; 32] = [
+            73, 73, 170, 112, 75, 235, 154, 81, 203, 8, 44, 245, 233, 18, 204, 136, 162, 9, 233,
+            49, 154, 201, 171, 175, 47, 6, 223, 101, 105, 80, 95, 166,
+        ];
+        let sig: [u8; 64] = [
+            164, 121, 89, 242, 88, 29, 80, 177, 104, 20, 102, 176, 48, 133, 68, 8, 105, 33, 58, 86,
+            28, 108, 198, 140, 160, 219, 62, 184, 154, 181, 140, 33, 35, 102, 183, 203, 111, 33,
+            55, 170, 180, 138, 92, 196, 185, 201, 122, 167, 15, 112, 9, 228, 226, 112, 111, 10,
+            142, 73, 85, 43, 81, 152, 204, 13,
+        ];
+
+        assert!(sig_verify(&pubkey, &sig, b"hello world").is_ok());
+
+        let parts: &[&[u8]] = &[b"hello", b" ", b"world"];
+        assert!(sig_verifyv(&pubkey, &sig, parts).is_ok());
+
+        let hash = Sha512::hashv(&[sig[..32].as_ref(), pubkey.as_ref(), b"hello world"]);
+        assert!(sig_verify_prehashed(&pubkey, &sig, &hash).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_wrapper_inputs() {
+        let pubkey: [u8; 32] = [
+            73, 73, 170, 112, 75, 235, 154, 81, 203, 8, 44, 245, 233, 18, 204, 136, 162, 9, 233,
+            49, 154, 201, 171, 175, 47, 6, 223, 101, 105, 80, 95, 166,
+        ];
+        let sig: [u8; 64] = [
+            164, 121, 89, 242, 88, 29, 80, 177, 104, 20, 102, 176, 48, 133, 68, 8, 105, 33, 58,
+            86, 28, 108, 198, 140, 160, 219, 62, 184, 154, 181, 140, 33, 35, 102, 183, 203, 111,
+            33, 55, 170, 180, 138, 92, 196, 185, 201, 122, 167, 15, 112, 9, 228, 226, 112, 111,
+            10, 142, 73, 85, 43, 81, 152, 204, 13,
+        ];
+
+        assert!(sig_verify(&pubkey[..31], &sig, b"hello world").is_err());
+        assert!(sig_verify(&pubkey, &sig[..63], b"hello world").is_err());
+        assert!(sig_verify_prehashed(&pubkey, &sig, &[0u8; 63]).is_err());
     }
 
     #[test]
@@ -194,8 +380,13 @@ mod tests {
 
         let message = "".as_bytes();
 
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, message).is_ok());
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, "not the right message".as_bytes()).is_err());
+        assert!(sig_verify_with_hasher::<Sha512>(&pubkey, &sig, message).is_ok());
+        assert!(sig_verify_with_hasher::<Sha512>(
+            &pubkey,
+            &sig,
+            "not the right message".as_bytes()
+        )
+        .is_err());
     }
 
     #[test]
@@ -216,8 +407,13 @@ mod tests {
 
         let message = "r".as_bytes(); // r = 72
 
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, message).is_ok());
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, "not the right message".as_bytes()).is_err());
+        assert!(sig_verify_with_hasher::<Sha512>(&pubkey, &sig, message).is_ok());
+        assert!(sig_verify_with_hasher::<Sha512>(
+            &pubkey,
+            &sig,
+            "not the right message".as_bytes()
+        )
+        .is_err());
     }
 
     #[test]
@@ -238,8 +434,12 @@ mod tests {
 
         let message = &[0xaf, 0x82];
 
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, message).is_ok());
-        assert!(sig_verify::<Sha512>(&pubkey, &sig, "not the right message".as_bytes()).is_err());
+        assert!(sig_verify_with_hasher::<Sha512>(&pubkey, &sig, message).is_ok());
+        assert!(sig_verify_with_hasher::<Sha512>(
+            &pubkey,
+            &sig,
+            "not the right message".as_bytes()
+        )
+        .is_err());
     }
-
 }
